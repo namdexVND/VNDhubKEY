@@ -1,0 +1,2265 @@
+-- ====================================================================
+-- 🔄 VND HUB | KEY SYSTEM - FIXED v2.3
+-- Fix: Hỗ trợ expireAt dạng Unix timestamp (từ script) VÀ date string (từ web)
+-- ====================================================================
+local HttpService  = game:GetService("HttpService")
+local Players      = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer  = Players.LocalPlayer
+
+-- ====== CONSTANTS ======
+local FILE_NAME        = "VND_CDVN_KEY_CACHE.txt"
+local API_TOKEN        = "695f7e6a085a446e0a3e7c89"
+local WEB_URL          = "https://vndhubfreekey.blogspot.com/2026/05/he-thong-xac-thuc-key-function.html"
+local DB               = "https://vndhubkey-default-rtdb.asia-southeast1.firebasedatabase.app"
+local KEY_PREFIX       = "VND_"
+local KEY_LENGTH       = 12
+local KEY_DURATION_SEC = 8 * 3600
+local INT32_MAX        = 2147483647
+local PERIOD_HOURS     = 8
+local TIMEOUT_SEC      = 60
+local COOLDOWN_SEC     = 3
+
+-- ====== STATE ======
+local keyOk     = false
+local userId    = tostring(LocalPlayer.UserId)
+local checking  = false
+local linkReady = false
+
+-- ====== GENERATE KEY ======
+local function generateUserKey()
+    local period = math.floor(os.time() / 3600 / PERIOD_HOURS)
+    local seed   = (period * 9999 + tonumber(userId)) % INT32_MAX
+    math.randomseed(seed)
+    local s = ""
+    for _ = 1, KEY_LENGTH do
+        s = s .. tostring(math.random(0, 9))
+    end
+    return KEY_PREFIX .. s
+end
+
+local MyCurrentKey = generateUserKey()
+
+-- ====== VALIDATE FORMAT KEY ======
+local function isValidKeyFormat(k)
+    if type(k) ~= "string" then return false end
+    return k:match("^VND_[%w_]+$") ~= nil
+end
+
+-- ====== FILE LOCAL ======
+local function SaveKey(k)
+    if writefile then
+        pcall(function() writefile(FILE_NAME, k) end)
+    end
+end
+
+local function LoadKey()
+    if isfile and readfile then
+        local ok, val = pcall(function()
+            if isfile(FILE_NAME) then return readfile(FILE_NAME) end
+            return ""
+        end)
+        if ok then return val or "" end
+    end
+    return ""
+end
+
+-- Xóa cache cũ
+local _cached = LoadKey()
+if _cached ~= "" then
+    SaveKey("")
+end
+
+-- ====== FIREBASE ======
+local function patchUserIdToFirebase(keyId)
+    local body = HttpService:JSONEncode({ userId = userId })
+    local ok, err = pcall(function()
+        HttpService:RequestAsync({
+            Url     = DB .. "/keys/" .. keyId .. ".json",
+            Method  = "PATCH",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body    = body
+        })
+    end)
+    if not ok then warn("[VND] Patch userId lỗi: " .. tostring(err)) end
+    return ok
+end
+
+local function saveKeyToFirebase(key)
+    local keyId = key:gsub("[^%w_]", "_")
+    local checkOk, checkRes = pcall(function()
+        return game:HttpGet(DB .. "/keys/" .. keyId .. ".json")
+    end)
+    if checkOk and checkRes and checkRes ~= "null" and checkRes ~= "" then
+        return false
+    end
+    local expireTime = os.time() + KEY_DURATION_SEC
+    local data = HttpService:JSONEncode({
+        key      = key,
+        userId   = "",
+        expireAt = expireTime,
+        type     = "normal",
+        created  = os.date("%d/%m/%Y %H:%M")
+    })
+    local ok, err = pcall(function()
+        game:HttpPost(DB .. "/keys/" .. keyId .. ".json", data, false, "application/json")
+    end)
+    if not ok then warn("[VND] Firebase lỗi: " .. tostring(err)) end
+    return ok
+end
+
+-- ====== FIX: Parse expireAt hỗ trợ cả Unix timestamp VÀ date string ======
+local function parseExpireAt(val)
+    if val == nil then return 0 end
+
+    -- Thử parse số trực tiếp (Unix timestamp từ script)
+    local n = tonumber(val)
+    if n then return n end
+
+    -- Thử parse dạng "YYYY-MM-DD" (date string từ web)
+    local s = tostring(val)
+    local y, m, d = s:match("^(%d%d%d%d)-(%d%d)-(%d%d)")
+    if y then
+        -- Convert sang Unix timestamp (end of day UTC)
+        return os.time({
+            year  = tonumber(y),
+            month = tonumber(m),
+            day   = tonumber(d),
+            hour  = 23,
+            min   = 59,
+            sec   = 59
+        })
+    end
+
+    -- Thử parse dạng "DD/MM/YYYY" phòng trường hợp
+    local d2, m2, y2 = s:match("^(%d%d)/(%d%d)/(%d%d%d%d)")
+    if d2 then
+        return os.time({
+            year  = tonumber(y2),
+            month = tonumber(m2),
+            day   = tonumber(d2),
+            hour  = 23,
+            min   = 59,
+            sec   = 59
+        })
+    end
+
+    return 0
+end
+
+-- ====== LINK RÚT GỌN ======
+local TargetUrl     = WEB_URL .. "?ma=" .. MyCurrentKey
+local ShortenedLink = TargetUrl
+
+task.spawn(function()
+    local api = "https://link4m.co/api-shorten/v2?api=" .. API_TOKEN
+                .. "&url=" .. HttpService:UrlEncode(TargetUrl)
+    local ok, res = pcall(function() return game:HttpGet(api) end)
+    if ok and res then
+        local s, d = pcall(function() return HttpService:JSONDecode(res) end)
+        if s and d and d.status == "success" and d.shortenedUrl then
+            ShortenedLink = d.shortenedUrl
+        end
+    end
+    linkReady = true
+    saveKeyToFirebase(MyCurrentKey)
+end)
+
+-- ====== UI HELPERS ======
+local function make(cls, props, parent)
+    local o = Instance.new(cls)
+    for k, v in pairs(props) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+local function corner(r, p)
+    Instance.new("UICorner", p).CornerRadius = UDim.new(0, r)
+end
+local function grad(c1, c2, rot, p)
+    local g = Instance.new("UIGradient", p)
+    g.Color    = ColorSequence.new(c1, c2)
+    g.Rotation = rot
+end
+local function stk(col, th, p)
+    local s = Instance.new("UIStroke", p)
+    s.Color = col; s.Thickness = th
+    return s
+end
+
+-- ====================================================================
+-- 🎨 GUI
+-- ====================================================================
+local SG = make("ScreenGui", {Name="VND_KeyGui", ResetOnSpawn=false},
+                LocalPlayer:WaitForChild("PlayerGui"))
+
+make("Frame", {
+    Size = UDim2.new(1,0,1,0),
+    BackgroundColor3       = Color3.fromRGB(0,0,0),
+    BackgroundTransparency = 0.5,
+    BorderSizePixel        = 0
+}, SG)
+
+local Card = make("Frame", {
+    Size = UDim2.new(0,380,0,285),
+    Position = UDim2.new(0.5,-190,0.54,-142),
+    BackgroundColor3       = Color3.fromRGB(8,8,16),
+    BorderSizePixel        = 0,
+    ClipsDescendants       = true,
+    BackgroundTransparency = 1
+}, SG)
+corner(18, Card)
+stk(Color3.fromRGB(90,45,200), 1.5, Card)
+grad(Color3.fromRGB(12,10,24), Color3.fromRGB(8,6,16), 135, Card)
+
+-- Header
+local Header = make("Frame", {
+    Size = UDim2.new(1,0,0,64),
+    Position = UDim2.new(0,0,0,3),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0
+}, Card)
+
+local IconCircle = make("Frame", {
+    Size = UDim2.new(0,38,0,38),
+    Position = UDim2.new(0,16,0.5,-19),
+    BackgroundColor3 = Color3.fromRGB(100,40,220),
+    BorderSizePixel  = 0
+}, Header)
+corner(19, IconCircle)
+grad(Color3.fromRGB(150,70,255), Color3.fromRGB(70,20,170), 135, IconCircle)
+make("TextLabel", {
+    Size = UDim2.new(1,0,1,0), BackgroundTransparency=1,
+    Text="🔑", TextSize=18, Font=Enum.Font.GothamBold,
+    TextColor3=Color3.new(1,1,1)
+}, IconCircle)
+
+make("TextLabel", {
+    Size=UDim2.new(1,-70,0,22), Position=UDim2.new(0,62,0,12),
+    BackgroundTransparency=1, Text="VND HUB",
+    TextColor3=Color3.fromRGB(235,230,255),
+    Font=Enum.Font.GothamBold, TextSize=18,
+    TextXAlignment=Enum.TextXAlignment.Left
+}, Header)
+make("TextLabel", {
+    Size=UDim2.new(1,-70,0,15), Position=UDim2.new(0,62,0,35),
+    BackgroundTransparency=1, Text="Xác thực Key • v2.3",
+    TextColor3=Color3.fromRGB(110,80,190),
+    Font=Enum.Font.Gotham, TextSize=11,
+    TextXAlignment=Enum.TextXAlignment.Left
+}, Header)
+
+-- Divider
+make("Frame", {
+    Size=UDim2.new(1,-32,0,1), Position=UDim2.new(0,16,0,69),
+    BackgroundColor3=Color3.fromRGB(35,25,65), BorderSizePixel=0
+}, Card)
+
+-- Label input
+make("TextLabel", {
+    Size=UDim2.new(1,-32,0,14), Position=UDim2.new(0,16,0,78),
+    BackgroundTransparency=1, Text="NHẬP KEY XÁC THỰC",
+    TextColor3=Color3.fromRGB(110,75,200),
+    Font=Enum.Font.GothamBold, TextSize=9,
+    TextXAlignment=Enum.TextXAlignment.Left
+}, Card)
+
+-- Input
+local InputBg = make("Frame", {
+    Size=UDim2.new(1,-32,0,42), Position=UDim2.new(0,16,0,95),
+    BackgroundColor3=Color3.fromRGB(14,12,26), BorderSizePixel=0
+}, Card)
+corner(12, InputBg)
+local InputStroke = stk(Color3.fromRGB(50,35,100), 1, InputBg)
+
+local TextBox = make("TextBox", {
+    Size=UDim2.new(1,-40,1,0), Position=UDim2.new(0,12,0,0),
+    BackgroundTransparency=1,
+    PlaceholderText="Dán key vào đây...",
+    PlaceholderColor3=Color3.fromRGB(60,50,90),
+    Text="",
+    TextColor3=Color3.fromRGB(210,200,255),
+    Font=Enum.Font.GothamMedium, TextSize=13,
+    ClearTextOnFocus=false,
+    TextXAlignment=Enum.TextXAlignment.Left
+}, InputBg)
+
+make("TextLabel", {
+    Size=UDim2.new(0,30,1,0), Position=UDim2.new(1,-34,0,0),
+    BackgroundTransparency=1, Text="🔐", TextSize=14
+}, InputBg)
+
+TextBox.Focused:Connect(function()
+    TweenService:Create(InputStroke, TweenInfo.new(0.15),
+        {Color=Color3.fromRGB(120,65,240), Thickness=1.5}):Play()
+end)
+TextBox.FocusLost:Connect(function()
+    TweenService:Create(InputStroke, TweenInfo.new(0.15),
+        {Color=Color3.fromRGB(50,35,100), Thickness=1}):Play()
+end)
+
+-- Status
+local StatusBox = make("Frame", {
+    Size=UDim2.new(1,-32,0,30), Position=UDim2.new(0,16,0,144),
+    BackgroundColor3=Color3.fromRGB(14,12,26),
+    BorderSizePixel=0, Visible=false
+}, Card)
+corner(9, StatusBox)
+local StatusLabel = make("TextLabel", {
+    Size=UDim2.new(1,-12,1,0), Position=UDim2.new(0,8,0,0),
+    BackgroundTransparency=1, Text="",
+    TextColor3=Color3.new(1,1,1),
+    Font=Enum.Font.GothamBold, TextSize=12,
+    TextXAlignment=Enum.TextXAlignment.Left,
+    TextTruncate=Enum.TextTruncate.AtEnd
+}, StatusBox)
+
+-- Buttons
+local BtnCheck = make("TextButton", {
+    Size=UDim2.new(0,178,0,40), Position=UDim2.new(0,16,0,183),
+    BackgroundColor3=Color3.fromRGB(40,167,69),
+    Text="✔  XÁC THỰC",
+    TextColor3=Color3.new(1,1,1),
+    Font=Enum.Font.GothamBold, TextSize=13,
+    BorderSizePixel=0, AutoButtonColor=false
+}, Card)
+corner(11, BtnCheck)
+grad(Color3.fromRGB(55,200,85), Color3.fromRGB(22,120,45), 90, BtnCheck)
+stk(Color3.fromRGB(35,170,60), 1, BtnCheck)
+
+local BtnGet = make("TextButton", {
+    Size=UDim2.new(0,178,0,40), Position=UDim2.new(0,198,0,183),
+    BackgroundColor3=Color3.fromRGB(100,40,200),
+    Text="⏳  ĐANG LẤY LINK...",
+    TextColor3=Color3.fromRGB(160,140,200),
+    Font=Enum.Font.GothamBold, TextSize=12,
+    BorderSizePixel=0, AutoButtonColor=false
+}, Card)
+corner(11, BtnGet)
+grad(Color3.fromRGB(140,65,245), Color3.fromRGB(65,18,160), 90, BtnGet)
+stk(Color3.fromRGB(110,45,215), 1, BtnGet)
+
+-- Footer
+make("TextLabel", {
+    Size=UDim2.new(1,0,0,18), Position=UDim2.new(0,0,0,262),
+    BackgroundTransparency=1,
+    Text="VND HUB  •  Firebase  •  2026",
+    TextColor3=Color3.fromRGB(40,32,65),
+    Font=Enum.Font.Gotham, TextSize=9
+}, Card)
+
+-- ====== HOVER ======
+local function addHover(btn)
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundTransparency=0.18}):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.1), {BackgroundTransparency=0}):Play()
+    end)
+    btn.MouseButton1Down:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.07), {BackgroundTransparency=0.35}):Play()
+    end)
+    btn.MouseButton1Up:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.07), {BackgroundTransparency=0}):Play()
+    end)
+end
+addHover(BtnCheck)
+addHover(BtnGet)
+
+-- ====== STATUS ======
+local function showStatus(text, color, icon)
+    StatusBox.Visible = true
+    StatusLabel.Text       = icon .. "  " .. text
+    StatusLabel.TextColor3 = color
+    TweenService:Create(StatusBox, TweenInfo.new(0.15), {
+        BackgroundColor3 = Color3.new(color.R*0.1, color.G*0.1, color.B*0.1)
+    }):Play()
+end
+
+-- ====== ENABLE / DISABLE BUTTONS ======
+local function setButtonsEnabled(enabled)
+    BtnCheck.Active = enabled
+    BtnCheck.TextColor3 = enabled
+        and Color3.new(1,1,1)
+        or  Color3.fromRGB(100,100,100)
+end
+
+-- ====== CLOSE & PASS ======
+local function closeAndPass()
+    task.wait(1.0)
+    TweenService:Create(Card, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+        Position = UDim2.new(0.5,-190,0.44,-142),
+        BackgroundTransparency = 1
+    }):Play()
+    task.wait(0.32)
+    SG:Destroy()
+    keyOk = true
+end
+
+-- ====== INTRO ANIM ======
+TweenService:Create(Card, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+    Position = UDim2.new(0.5,-190,0.5,-142),
+    BackgroundTransparency = 0
+}):Play()
+
+-- ====== CẬP NHẬT NÚT LẤY LINK ======
+task.spawn(function()
+    local waited = 0
+    while not linkReady and waited < 10 do
+        task.wait(0.5)
+        waited += 0.5
+    end
+    if ShortenedLink ~= TargetUrl then
+        BtnGet.Text = "🔗  LẤY LINK"
+    else
+        BtnGet.Text = "🔗  LẤY LINK (gốc)"
+    end
+    BtnGet.TextColor3 = Color3.new(1,1,1)
+end)
+
+-- ====== SỰ KIỆN: LẤY LINK ======
+BtnGet.MouseButton1Click:Connect(function()
+    if not linkReady then
+        showStatus("Đang lấy link, chờ chút!", Color3.fromRGB(255,200,0), "⏳")
+        return
+    end
+    if setclipboard then
+        setclipboard(ShortenedLink)
+        showStatus("Đã copy link! Hoàn thành quảng cáo.", Color3.fromRGB(150,90,255), "📋")
+    else
+        showStatus("Thiết bị không hỗ trợ copy.", Color3.fromRGB(255,100,50), "⚠️")
+    end
+end)
+
+-- ====== SỰ KIỆN: XÁC THỰC ======
+BtnCheck.MouseButton1Click:Connect(function()
+    if checking then return end
+    checking = true
+    setButtonsEnabled(false)
+
+    local input = TextBox.Text:match("^%s*(.-)%s*$")
+
+    if input == "" then
+        showStatus("Vui lòng nhập key!", Color3.fromRGB(255,100,50), "⚠️")
+        task.wait(COOLDOWN_SEC)
+        checking = false
+        setButtonsEnabled(true)
+        return
+    end
+
+    if not isValidKeyFormat(input) then
+        showStatus("Key không đúng định dạng!", Color3.fromRGB(255,60,60), "❌")
+        task.wait(COOLDOWN_SEC)
+        checking = false
+        setButtonsEnabled(true)
+        return
+    end
+
+    showStatus("Đang xác thực...", Color3.fromRGB(255,200,0), "⏳")
+
+    local keyId = input:gsub("[^%w_]", "_")
+    local url   = DB .. "/keys/" .. keyId .. ".json"
+    local ok, res = pcall(function() return game:HttpGet(url) end)
+
+    if not ok or res == nil or res == "" then
+        showStatus("Lỗi kết nối Firebase!", Color3.fromRGB(255,100,0), "⚠️")
+        task.wait(COOLDOWN_SEC)
+        StatusBox.Visible = false
+        checking = false
+        setButtonsEnabled(true)
+        return
+    end
+
+    if res == "null" then
+        TextBox.Text = ""
+        showStatus("Key không tồn tại! Bấm LẤY LINK.", Color3.fromRGB(255,140,0), "⌛")
+        task.wait(COOLDOWN_SEC)
+        StatusBox.Visible = false
+        checking = false
+        setButtonsEnabled(true)
+        return
+    end
+
+    local dok, data = pcall(function() return HttpService:JSONDecode(res) end)
+    if not dok or data == nil then
+        TextBox.Text = ""
+        showStatus("Key không tồn tại! Bấm LẤY LINK.", Color3.fromRGB(255,140,0), "⌛")
+        task.wait(COOLDOWN_SEC)
+        StatusBox.Visible = false
+        checking = false
+        setButtonsEnabled(true)
+        return
+    end
+
+    local isVip = data.type == "vip"
+
+    local ownerOk = data.userId == nil
+                 or data.userId == ""
+                 or data.userId == userId
+
+    -- ====== FIX: Dùng parseExpireAt thay vì tonumber trực tiếp ======
+    local expireTimestamp = parseExpireAt(data.expireAt or data.expire)
+    local notExpired = isVip or (os.time() <= expireTimestamp)
+
+    if not ownerOk then
+        showStatus("Key không thuộc về bạn!", Color3.fromRGB(255,60,60), "❌")
+        task.wait(COOLDOWN_SEC)
+        StatusBox.Visible = false
+        checking = false
+        setButtonsEnabled(true)
+
+    elseif not notExpired then
+        local expiredAgo = os.time() - expireTimestamp
+        local minsAgo    = math.floor(expiredAgo / 60)
+        TextBox.Text = ""
+        showStatus("Hết hạn " .. minsAgo .. " phút trước! Lấy key mới.", Color3.fromRGB(255,140,0), "⌛")
+        task.wait(COOLDOWN_SEC)
+        StatusBox.Visible = false
+        checking = false
+        setButtonsEnabled(true)
+
+    else
+        local needsPatch = (data.userId == nil or data.userId == "")
+        if needsPatch then
+            showStatus("Đang gắn tài khoản...", Color3.fromRGB(100,180,255), "🔗")
+            local patched = patchUserIdToFirebase(keyId)
+            if not patched then
+                showStatus("Lỗi gắn tài khoản, thử lại!", Color3.fromRGB(255,100,0), "⚠️")
+                task.wait(COOLDOWN_SEC)
+                StatusBox.Visible = false
+                checking = false
+                setButtonsEnabled(true)
+                return
+            end
+        end
+
+        local timeStr
+        if isVip then
+            timeStr = "VIP - Vĩnh viễn 👑"
+        else
+            local remaining = expireTimestamp - os.time()
+            local hrsLeft   = math.floor(remaining / 3600)
+            local minsLeft  = math.floor((remaining % 3600) / 60)
+            timeStr = hrsLeft > 0
+                and (hrsLeft .. "h " .. minsLeft .. "m")
+                or  (minsLeft .. " phút")
+        end
+
+        local msg = needsPatch
+            and ("Key đã gắn vào bạn! Còn " .. timeStr)
+            or  ("Thành công! Còn " .. timeStr)
+
+        SaveKey(input)
+        showStatus(msg, Color3.fromRGB(50,220,100), "🕐")
+        closeAndPass()
+    end
+end)
+
+-- ====== REPEAT UNTIL với TIMEOUT ======
+local startWait = os.clock()
+repeat
+    task.wait()
+until keyOk == true or os.clock() - startWait > TIMEOUT_SEC
+
+------------------------------------------------------
+-- 👉 DÁN CODE CHÍNH CỦA BẠN DƯỚI ĐÂY 👇
+------------------------------------------------------
+repeat task.wait() until game:IsLoaded()
+
+-- 🟣 Tải giao diện Fluent bằng link gốc chính thức
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+
+-- 🪟 Cửa sổ chính (Kích thước chuẩn 450x340 gọn gàng)
+local Window = Fluent:CreateWindow({
+	Title = "VND hub",
+	SubTitle = "Version 1.5.2",
+	TabWidth = 157,
+	Size = UDim2.fromOffset(455, 340),
+	Acrylic = true,
+	Theme = "Dark",
+	MinimizeKey = Enum.KeyCode.End
+})
+
+-- 🟢 Nút mở/tắt menu chính nổi trên màn hình
+local ScreenGui = Instance.new("ScreenGui")
+local ImageButton = Instance.new("ImageButton")
+local UICorner = Instance.new("UICorner")
+
+ScreenGui.Parent = game.CoreGui
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+ImageButton.Parent = ScreenGui
+ImageButton.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+ImageButton.BorderSizePixel = 0
+ImageButton.Position = UDim2.new(0.10615778, 0, 0.16217947, 0)
+ImageButton.Size = UDim2.new(0, 40, 0, 40)
+ImageButton.Draggable = true
+ImageButton.Image = "http://www.roblox.com/asset/?id=126677255840605"
+
+UICorner.CornerRadius = UDim.new(1, 10)
+UICorner.Parent = ImageButton
+
+ImageButton.MouseButton1Down:Connect(function()
+    Window:Minimize()
+end)
+
+-- 📑 Các tab chức năng chính
+local Tabs = {
+	Main1 = Window:AddTab({ Title = "Main" }),
+	Main2 = Window:AddTab({ Title = "Farm Level" }),
+	Main3 = Window:AddTab({ Title = "Farm Tiền" }),
+	Main4 = Window:AddTab({ Title = "Mua đồ" }),
+	Main5 = Window:AddTab({ Title = "Farm Sự Kiện" }),
+	Main6 = Window:AddTab({ Title = "Farm Boss" }),
+	Main7 = Window:AddTab({ Title = "PVP Combat" }),
+	Main8 = Window:AddTab({ Title = "Fix Lag" }),
+	Main9 = Window:AddTab({ Title = "Settings" })
+}
+
+------------------------------------------------
+-- KHỞI TẠO BIẾN TOÀN CỤC (_G)
+------------------------------------------------
+-- Farm Level
+_G.AutoFarmLevel = false
+_G.NpcDistance=18.2
+_G.NpcSpeed=0.05
+_G.AutoLootEnabled = false
+_G.AutoFarmChua = false
+_G.AntiAFKEnabled = false 
+
+-- Farm Tiền & Sự Kiện & Mật Ong
+_G.AutoFarmBanhMi = false 
+_G.AutoFarmBenhVien = false 
+_G.AutoFarmCaoSu = false 
+_G.AutoFarmChotCongAn = false 
+_G.AutoFarmSuKien = false 
+_G.AutoFarmMatOng = false 
+_G.SelectedVehicle = nil
+_G.SelectedItem = nil
+_G.SelectedFood = nil
+
+-- Farm Boss
+_G.TeleportToBoss = false
+_G.SelectedBossMode = "Chế Độ 1"
+_G.AutoFarmBossCircle = false 
+_G.BossSettings = _G.BossSettings or {}
+_G.BossSettings.Mode1 = _G.BossSettings.Mode1 or {Dist = 20, Speed = 0.0005}
+_G.BossSettings.Mode2 = _G.BossSettings.Mode2 or {Radius = 20, Speed = 1000}
+_G.AutoLootBossEnabled= false   
+_G.AutoAimBossNoCam = false     
+_G.ShowBossTracker = false
+_G.ArenaCameraEnabled = false
+
+-- PVP Combat           
+_G.PvpAutoAttack = false
+_G.AutoBandageEnabled = false
+_G.AutoBuyBandage = false
+_G.AutoBuyBandageAmount = 1
+local lastBuy = 0
+_G.PvpAimNoCamActive = false    
+_G.PvpHitboxActive = false
+_G.PvpSpinActive = false
+_G.PvpSpeedActive = false
+_G.PvpJumpActive = false
+
+-- Hệ thống Quản lý Config
+local ConfigFolderName = "VND_MultiConfigs"
+local GlobalSettingsFile = "VND_System_Global.json"
+_G.SelectedConfigName = ""
+_G.UseConfigSystem = false
+
+------------------------------------------------
+-- CẤU HÌNH LOGIC CHUNG & CÀY CẤP QUÁI THƯỜNG
+------------------------------------------------
+local Players = game:GetService("Players")
+local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+local freecamPosition = Vector3.new(0,0,0)
+local flySpeed = 2
+
+local function isAliveModel(model)
+    if model and model:FindFirstChild("Humanoid") and model.Humanoid.Health > 0 then
+        return true
+    end
+    return false
+end
+
+local function getNearestMonster()
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local hrpPos = char.HumanoidRootPart.Position
+    local closestMonster = nil
+    local maxDistance = math.huge
+    local targetFolder = workspace:FindFirstChild("Bosses") or workspace:FindFirstChild("Monsters") or workspace
+    
+    for _, obj in ipairs(targetFolder:GetChildren()) do
+        if obj:IsA("Model") and isAliveModel(obj) and obj ~= char then
+            if not Players:GetPlayerFromCharacter(obj) then 
+                local mHrp = obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("Torso")
+                if mHrp then
+                    local distance = (hrpPos - mHrp.Position).Magnitude
+                    if distance < maxDistance then
+                        maxDistance = distance
+                        closestMonster = obj
+                    end
+                end
+            end
+        end
+    end
+    return closestMonster
+end
+
+-- [ LOGIC SNAP-DASH SIÊU TỐC - TỰ ĐỘNG CÀY CẤP ]
+local Players=game:GetService("Players")
+local VirtualUser=game:GetService("VirtualUser")
+local Workspace=game:GetService("Workspace")
+
+local player=Players.LocalPlayer
+
+_G.Settings={TargetName="CityNPC",DashDist=18.2,Speed=0.05}
+_G.AutoFarmLevel=false
+
+local lastDash=0
+local lockedTarget=nil
+local lockedPosition=nil
+
+task.spawn(function()
+while task.wait() do
+if _G.AutoFarmLevel then
+pcall(function()
+
+local character=player.Character
+if not character then return end
+
+local hrp=character:FindFirstChild("HumanoidRootPart")
+local humanoid=character:FindFirstChild("Humanoid")
+
+if not hrp or not humanoid then return end
+
+if not lockedTarget or not lockedTarget.Parent or not lockedTarget:FindFirstChild("Humanoid") or lockedTarget.Humanoid.Health<=0 then
+
+lockedTarget=nil
+lockedPosition=nil
+
+for _,obj in pairs(Workspace:GetDescendants()) do
+if obj.Name==_G.Settings.TargetName and obj:FindFirstChild("HumanoidRootPart") and obj:FindFirstChild("Humanoid") and obj.Humanoid.Health>0 then
+
+lockedTarget=obj
+lockedPosition=obj.HumanoidRootPart.Position
+break
+end
+end
+end
+
+if not lockedTarget then
+return
+end
+
+local targetHrp=lockedTarget:FindFirstChild("HumanoidRootPart")
+local targetHum=lockedTarget:FindFirstChild("Humanoid")
+
+if not targetHrp or not targetHum then
+lockedTarget=nil
+lockedPosition=nil
+return
+end
+
+targetHrp.CFrame=CFrame.new(lockedPosition)
+targetHum.WalkSpeed=0
+targetHum.JumpPower=0
+targetHum.PlatformStand=true
+
+if tick()-lastDash>=_G.Settings.Speed then
+lastDash=tick()
+
+local offsets={
+Vector3.new(_G.Settings.DashDist,0,0),
+Vector3.new(-_G.Settings.DashDist,0,0),
+Vector3.new(0,0,_G.Settings.DashDist),
+Vector3.new(0,0,-_G.Settings.DashDist)
+}
+
+local randomOffset=offsets[math.random(1,#offsets)]
+
+hrp.CFrame=CFrame.lookAt(
+lockedPosition+randomOffset,
+lockedPosition
+)
+
+hrp.AssemblyLinearVelocity=Vector3.zero
+
+local tool=character:FindFirstChildOfClass("Tool")
+
+if tool then
+tool:Activate()
+
+pcall(function()
+tool:Activate()
+end)
+
+else
+VirtualUser:CaptureController()
+
+VirtualUser:Button1Down(Vector2.new(500,500))
+task.wait(0.03)
+VirtualUser:Button1Up(Vector2.new(500,500))
+end
+end
+end)
+
+else
+lockedTarget=nil
+lockedPosition=nil
+end
+end
+end)
+
+
+------------------------------------------------
+-- LOGIC TỰ ĐỘNG NHẶT ĐỒ (AUTO LOOT)
+------------------------------------------------
+task.spawn(function()
+while true do
+task.wait(0.5)
+
+if _G.AutoLootEnabled or _G.AutoLootBossEnabled then
+pcall(function()
+
+local char=game:GetService("Players").LocalPlayer.Character
+local hrp=char and char:FindFirstChild("HumanoidRootPart")
+
+if hrp then
+for _,v in ipairs(workspace:GetDescendants()) do
+
+if v:IsA("ProximityPrompt") then
+local pos=v.Parent:IsA("BasePart") and v.Parent.Position or (v.Parent:IsA("Model") and v.Parent:GetPivot().Position)
+
+if pos and (hrp.Position-pos).Magnitude<=20 then
+fireproximityprompt(v)
+end
+end
+
+if v:IsA("TouchInterest") and v.Parent:IsA("BasePart") then
+if (hrp.Position-v.Parent.Position).Magnitude<=20 then
+firetouchinterest(hrp,v.Parent,0)
+firetouchinterest(hrp,v.Parent,1)
+end
+end
+
+end
+end
+
+end)
+end
+
+end
+end)
+
+
+------------------------------------------------
+-- LOGIC TREO MÁY & ANTI-AFK TOÀN DIỆN
+------------------------------------------------
+local ToaDoChua1 = Vector3.new(1561, 133, -244)
+local ToaDoChua2 = Vector3.new(1547, 133, -245)
+
+local TDBanhMi = {
+    Vector3.new(573, 21, -357),
+    Vector3.new(563, 20, -386),
+    Vector3.new(553, 20, -413),
+    Vector3.new(531, 21, -449)
+}
+
+local TDBenhVien = {
+    Vector3.new(790, 22, -403),
+    Vector3.new(790, 22, -413)
+}
+
+local TDCaoSu = {
+    Vector3.new(1681, 19, -456),
+    Vector3.new(1723, 19, -388)
+}
+
+local TDChotCongAn = Vector3.new(734, 20, -812)
+local TDSuKien = Vector3.new(0, 0, 0) 
+
+local TDMatOng = {
+    Vector3.new(567, 19, -533),
+    Vector3.new(626, 19, -511),
+    Vector3.new(629, 19, -419)
+}
+
+local TDBoss = Vector3.new(-2823, 274, -1896)
+local TDBossTam = Vector3.new(-2790, 240, -1761) 
+
+local function isAreaOccupied(targetPos)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+            if (p.Character.HumanoidRootPart.Position - targetPos).Magnitude <= 7 then
+                return true
+            end
+        end
+    end
+    for _, v in ipairs(workspace:GetDescendants()) do
+        if v:IsA("Seat") or v:IsA("VehicleSeat") then
+            if (v.Position - targetPos).Magnitude <= 7 and v.Occupant and v.Occupant.Parent ~= player.Character then 
+                return true 
+            end
+        end
+    end
+    return false
+end
+
+local function interactWithSeatPrompt(targetPos)
+    for _, prompt in ipairs(workspace:GetDescendants()) do
+        if prompt:IsA("ProximityPrompt") and (prompt.Parent:IsA("BasePart") or prompt.Parent:IsA("Model")) then
+            if (prompt.Parent.Position - targetPos).Magnitude <= 6 then
+                 fireproximityprompt(prompt)
+                break
+            end
+        end
+    end
+end
+
+------------------------------------------------
+-- MUA Đồ no chatgpt,gemini
+------------------------------------------------
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local remoteEvent = ReplicatedStorage:WaitForChild("KnitPackages"):WaitForChild("_Index"):WaitForChild("sleitnick_knit@1.7.0"):WaitForChild("knit"):WaitForChild("Services"):WaitForChild("VehicleShopService"):WaitForChild("RE"):WaitForChild("buyVehicle")
+
+-- Danh sách xe
+local vehicleList = {
+    "Xe cấp cứu", "Yaz 125", "Wave độ", "Sirius", "Xe điện Xmen Neo", "Sonic 150", 
+    "Winner X 150", "Dream 110", "Ducati 1299", "Duke 390", "Exciter 135", 
+    "Exciter Decal 2023", "Exciter movistar", "Exciter Độ 2021", "HONDA X-ADV 150", 
+    "PCX 2025 White", "R1 Black", "Click 150 Độ", "S1000RR", "Satria 150", 
+    "Z1000 (2013)", "Yamaha aerox 155", "Liberty S", "KTM 390 RC", "Hornet 600", 
+    "Vision 150", "Vespa độ (White)", "Xe điện Jodonin", "Wave 110", 
+    "ZX-6R Xanh", "GSXR 650", "SH 350i", "AB 150", "Cub 50", "Xe đạp",
+    "Merc SL63", "Lamborghini SC20", "Z1000 Đen", "CBR1000R", "R6", 
+    "2017 Kia Morning", "Vinfast Lux A2.0 (Đen)", "Ford (Cam)", "Lamborghini (Hồng)", 
+    "Lamborghini (Trắng)", "Lamborghini (Xanh)", "Ducati Monter 1100", 
+    "Mclaren Orange", "Mclaren Blue", "Mclaren Red", "Mercedes s450", 
+    "Suzuki Jimny", "Toyota Camry (Trắng)", "BMW M5 cs", "Potcher 911"
+}
+
+-------
+--mua Vũ khí 
+-------
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local buyItemEvent = ReplicatedStorage:WaitForChild("KnitPackages"):WaitForChild("_Index"):WaitForChild("sleitnick_knit@1.7.0"):WaitForChild("knit"):WaitForChild("Services"):WaitForChild("ShopService"):WaitForChild("RE"):WaitForChild("buyItem")
+
+-- Danh sách vật phẩm
+local itemList = {
+    "PhongLon", "MaTau", "Mưa thủy tinh", "BoomBox", "Sign", 
+    "lòng đèn", "Bát Xà Mâu", "Đại đao", "Vợt muỗi", 
+    "Sign(mùa hè)", "Guitar(mùa hè)", "Cặp táp học sinh"
+}
+
+--------------
+--mua đồ ăn 
+--------------
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local buyItemEvent = ReplicatedStorage:WaitForChild("KnitPackages"):WaitForChild("_Index"):WaitForChild("sleitnick_knit@1.7.0"):WaitForChild("knit"):WaitForChild("Services"):WaitForChild("ShopService"):WaitForChild("RE"):WaitForChild("buyItem")
+
+-- Danh sách 20 món ăn
+local foodList = {
+    "Bún bò", "Phở", "Bún cá", "Bún Riêu", "7 Down", 
+    "Cam ép", "Coca", "Coffee", "Fanta", "Kem que", 
+    "Kem óc quế", "Pepi", "Trà sữa", "Trà sữa bạc hà", 
+    "Trà sữa dâu", "Trà sữa khoai môn", "Bánh mì", 
+    "Sting red", "Sting Blue", "Nước suối"
+}
+
+
+------------------------------------------------
+-- HỆ THỐNG GIẢM TẢI ĐỒ HỌA CHUYÊN SÂU THEO %
+------------------------------------------------
+local originalMaterials = {}
+
+local function saveOriginalMaterials()
+    if next(originalMaterials) == nil then
+        for _, v in ipairs(workspace:GetDescendants()) do
+            if v:IsA("BasePart") then
+                originalMaterials[v] = {
+                    Material = v.Material,
+                    Reflectance = v.Reflectance,
+                    CastShadow = v.CastShadow
+                }
+            end
+        end
+    end
+end
+
+local function toggleGraphicReduction(percent, enable)
+    saveOriginalMaterials()
+    local totalParts = 0
+    for _ in pairs(originalMaterials) do totalParts = totalParts + 1 end
+    if totalParts == 0 then return end
+
+    local targetCount = math.floor(totalParts * (percent / 100))
+    local currentCount = 0
+
+    for part, data in pairs(originalMaterials) do
+        if part and part.Parent then
+            currentCount = currentCount + 1
+            if currentCount <= targetCount then
+                if enable then
+                    part.Material = Enum.Material.SmoothPlastic
+                    part.Reflectance = 0
+                    part.CastShadow = false
+                else
+                    part.Material = data.Material
+                    part.Reflectance = data.Reflectance
+                    part.CastShadow = data.CastShadow
+                end
+            end
+        end
+    end
+end
+
+local function activateFPSBoost()
+    settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+    Lighting.GlobalShadows = false
+    Lighting.Brightness = 0
+    Lighting.FogEnd = 1e9
+end
+
+local function deactivateFPSBoost()
+    Lighting.GlobalShadows = true
+    Lighting.Brightness = 2
+    Lighting.FogEnd = 1000
+end
+
+local function isAnyFarmActive()
+    return _G.AntiAFKEnabled or _G.AutoFarmChua or _G.AutoFarmBanhMi or _G.AutoFarmBenhVien or _G.AutoFarmCaoSu or _G.AutoFarmChotCongAn or _G.AutoFarmSuKien or _G.AutoFarmMatOng or _G.TeleportToBoss or _G.AutoFarmBossCircle
+end
+
+player.Idled:Connect(function()
+    if isAnyFarmActive() then
+        VirtualUser:Button2Down(Vector2.new(), camera.CFrame)
+        task.wait(0.5)
+        VirtualUser:Button2Up(Vector2.new(), camera.CFrame)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(250)
+        if isAnyFarmActive() then
+            pcall(function()
+                if not _G.FreecamEnabled and not _G.LockCameraEnabled and not _G.AutoAimBossNoCam then
+                    camera.CFrame *= CFrame.Angles(0, math.rad(5), 0)
+                end
+                VirtualUser:Button2Down(Vector2.new(), camera.CFrame)
+                task.wait(0.5)
+                VirtualUser:Button2Up(Vector2.new(), camera.CFrame)
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if _G.AutoFarmChua then
+            pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                if hrp and humanoid and not humanoid.SeatPart then
+                    local finalTarget = ToaDoChua1
+                    if isAreaOccupied(ToaDoChua1) then finalTarget = ToaDoChua2 end
+                    hrp.CFrame = CFrame.new(finalTarget + Vector3.new(0, 2, 0))
+                    task.wait(0.1)
+                    interactWithSeatPrompt(finalTarget)
+                end
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if _G.AutoFarmBanhMi then
+            pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                if hrp and humanoid and not humanoid.SeatPart then
+                    local finalTarget = nil
+                    for i = 1, #TDBanhMi do
+                        if not isAreaOccupied(TDBanhMi[i]) then finalTarget = TDBanhMi[i] break end
+                    end
+                    if not finalTarget then finalTarget = TDBanhMi[1] end
+                    hrp.CFrame = CFrame.new(finalTarget + Vector3.new(0, 2, 0))
+                    task.wait(0.1)
+                    interactWithSeatPrompt(finalTarget)
+                end
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if _G.AutoFarmBenhVien then
+             pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                if hrp and humanoid and not humanoid.SeatPart then
+                    local finalTarget = nil
+                    for i = 1, #TDBenhVien do
+                        if not isAreaOccupied(TDBenhVien[i]) then finalTarget = TDBenhVien[i] break end
+                    end
+                    if not finalTarget then finalTarget = TDBenhVien[1] end
+                    hrp.CFrame = CFrame.new(finalTarget + Vector3.new(0, 2, 0))
+                    task.wait(0.1)
+                    interactWithSeatPrompt(finalTarget)
+                end
+            end)
+        end
+   end
+end)
+
+local currentCaoSuTarget = nil
+task.spawn(function()
+    while true do
+         task.wait(0.8)
+        if _G.AutoFarmCaoSu then
+            pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                     if not currentCaoSuTarget or (isAreaOccupied(currentCaoSuTarget)) then
+                        local chosen = nil
+                        for i = 1, #TDCaoSu do
+                            if not isAreaOccupied(TDCaoSu[i]) then chosen = TDCaoSu[i] break end
+                        end
+                        currentCaoSuTarget = chosen or TDCaoSu[1]
+                    end
+                    hrp.CFrame = CFrame.new(currentCaoSuTarget + Vector3.new(0, 2, 0))
+                end
+            end)
+        else
+            currentCaoSuTarget = nil
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+         task.wait(0.8)
+        if _G.AutoFarmChotCongAn then
+             pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    if not isAreaOccupied(TDChotCongAn) then
+                        hrp.CFrame = CFrame.new(TDChotCongAn + Vector3.new(0, 2, 0))
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if _G.AutoFarmSuKien then
+            pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                if hrp and humanoid then
+                    if (hrp.Position - TDSuKien).Magnitude > 5 then
+                        hrp.CFrame = CFrame.new(TDSuKien + Vector3.new(0, 2, 0))
+                    end
+                    task.wait(0.1)
+                    interactWithSeatPrompt(TDSuKien)
+                end
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if _G.AutoFarmMatOng then
+            pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+                if hrp and humanoid and not humanoid.SeatPart then
+                    local finalTarget = nil
+                    for i = 1, #TDMatOng do
+                        if not isAreaOccupied(TDMatOng[i]) then 
+                            finalTarget = TDMatOng[i] 
+                            break 
+                        end
+                    end
+                    if not finalTarget then finalTarget = TDMatOng[1] end
+                    hrp.CFrame = CFrame.new(finalTarget + Vector3.new(0, 2, 0))
+                    task.wait(0.1)
+                    interactWithSeatPrompt(finalTarget)
+                end
+            end)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if _G.TeleportToBoss then
+            pcall(function()
+                local char = player.Character
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp and (hrp.Position - TDBoss).Magnitude > 3 then
+                    hrp.CFrame = CFrame.new(TDBoss)
+                end
+            end)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- CHẾ ĐỘ 1: FARM BOSS (ĐÃ SỬA LỖI ĐIỀU KIỆN)
+--------------------------------------------------------------------
+local FIXED_BOSS_POS = Vector3.new(-2790, 239, -1762)
+local lastDash = 0
+
+-- Chạy vòng lặp kiểm tra liên tục, không bao bọc bằng if ở ngoài
+task.spawn(function()
+    while true do
+        task.wait() -- Luôn chờ để tránh crash game
+
+        -- Kiểm tra điều kiện: Phải bật Auto Farm VÀ chọn đúng Chế độ 1
+        if _G.SelectedBossMode == "Chế Độ 1" and _G.AutoFarmBossCircle and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            pcall(function()
+                local hrp = player.Character.HumanoidRootPart    
+                local target = nil    
+
+                -- 🔍 TÌM BOSS
+                for _, obj in pairs(workspace:GetDescendants()) do    
+                    if obj.Name == "NPC2" and obj:FindFirstChild("HumanoidRootPart") and obj:FindFirstChild("Humanoid") then    
+                        if obj.Humanoid.Health > 0 then    
+                            target = obj.HumanoidRootPart    
+                            target.CFrame = CFrame.new(FIXED_BOSS_POS)    
+                            obj.Humanoid.WalkSpeed = 0    
+                            obj.Humanoid.JumpPower = 0    
+                            break    
+                        end    
+                    end    
+                end    
+
+                -- ⚡ TELE DASH + AIM
+                -- Sử dụng tham số từ _G.BossSettings.Mode1
+                local dashSettings = _G.BossSettings.Mode1 or {Dist = 18.2, Speed = 0.05}
+                
+                if target and (tick() - lastDash > dashSettings.Speed) then    
+                    lastDash = tick()    
+                    local dist = dashSettings.Dist
+                    local offsets = {Vector3.new(dist, 0, 0), Vector3.new(-dist, 0, 0), Vector3.new(0, 0, dist), Vector3.new(0, 0, -dist)}
+                    local targetPos = FIXED_BOSS_POS + offsets[math.random(1, #offsets)]    
+
+                    if _G.AutoAimBossNoCam then    
+                        hrp.CFrame = CFrame.new(targetPos, Vector3.new(FIXED_BOSS_POS.X, hrp.Position.Y, FIXED_BOSS_POS.Z))    
+                    else    
+                        hrp.CFrame = CFrame.new(targetPos)    
+                    end    
+
+                    hrp.AssemblyLinearVelocity = Vector3.zero 
+
+                    -- 🥊 AUTO ĐÁNH
+                    local tool = player.Character:FindFirstChildOfClass("Tool")    
+                    if tool then    
+                        tool:Activate()    
+                    else    
+                        VirtualUser:CaptureController()    
+                        VirtualUser:Button1Down(Vector2.new(0,0))    
+                        task.delay(0.02, function() VirtualUser:Button1Up(Vector2.new(0,0)) end)    
+                    end    
+                end    
+            end)    
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- CHế ĐỘ 2 FARM BOSS
+--------------------------------------------------------------------
+local angle = 0 -- Biến này phải nằm ngoài vòng lặp để góc tăng dần liên tục
+local FIXED_BOSS_POS = Vector3.new(-2790, 239, -1762)
+
+task.spawn(function()
+    while task.wait() do
+        -- Chỉ chạy khi Chế độ 2 được chọn và công tắc Auto Farm được bật
+        if _G.SelectedBossMode == "Chế Độ 2" and _G.AutoFarmBossCircle and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            pcall(function()
+                local hrp = player.Character.HumanoidRootPart
+                local target = nil
+                
+                -- Tìm Boss
+                for _, obj in pairs(workspace:GetDescendants()) do
+                    if obj.Name == "NPC2" and obj:FindFirstChild("HumanoidRootPart") and obj:FindFirstChild("Humanoid") then
+                        if obj.Humanoid.Health > 0 then
+                            target = obj.HumanoidRootPart
+                            obj.Humanoid.WalkSpeed = 0
+                            target.CFrame = CFrame.new(FIXED_BOSS_POS)
+                            break
+                        end
+                    end
+                end
+
+                if target then
+                    -- Lấy thông số từ biến _G.BossSettings mà bạn đã thiết lập trong Fluent
+                    local radius = _G.BossSettings.Mode2.Radius or 19
+                    local rotSpeed = _G.BossSettings.Mode2.Speed or 0.001
+                    
+                    -- Tính toán vị trí vòng tròn
+                    angle = (angle + rotSpeed) % (math.pi * 2)
+                    local x = math.cos(angle) * radius
+                    local z = math.sin(angle) * radius
+                    local targetPos = FIXED_BOSS_POS + Vector3.new(x, 0, z)
+
+                    -- Di chuyển & Aim
+                    hrp.CFrame = CFrame.new(targetPos, FIXED_BOSS_POS)
+
+                    -- Auto Đánh
+                    local tool = player.Character:FindFirstChildOfClass("Tool")
+                    if tool then 
+                        tool:Activate() 
+                    else
+                        VirtualUser:CaptureController()
+                        VirtualUser:Button1Down(Vector2.new(0,0))
+                        task.wait(0.05)
+                        VirtualUser:Button1Up(Vector2.new(0,0))
+                    end
+                end
+            end)
+        end
+    end
+end)
+
+--------------------------------------------------------------------
+-- auto nhìn máu boss
+--------------------------------------------------------------------
+local RunService = game:GetService("RunService")
+
+local guiName = "VND_NPC_Tracker"
+_G.ShowBossTracker = false
+
+local ScreenGui = game.CoreGui:FindFirstChild(guiName)
+if not ScreenGui then
+    ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = guiName
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.DisplayOrder = -1 -- thấp hơn menu chính
+    ScreenGui.Parent = game.CoreGui
+end
+
+local Frame = ScreenGui:FindFirstChild("TrackerFrame") or Instance.new("Frame")
+Frame.Parent = ScreenGui
+Frame.Name = "TrackerFrame"
+
+Frame.Size = UDim2.new(0, 180, 0, 60)
+Frame.Position = UDim2.new(0.5, -90, 0.35, 0) -- 👇 kéo xuống dưới menu
+Frame.BackgroundColor3 = Color3.fromRGB(25,25,35)
+Frame.BorderSizePixel = 0
+Frame.Active = true
+Frame.Draggable = true
+Frame.Visible = false
+Frame.ZIndex = 1
+
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 8)
+
+local Stroke = Frame:FindFirstChild("UIStroke") or Instance.new("UIStroke")
+Stroke.Parent = Frame
+Stroke.Color = Color3.fromRGB(150,80,250)
+
+local NameLabel = Frame:FindFirstChild("NameLabel") or Instance.new("TextLabel")
+NameLabel.Parent = Frame
+NameLabel.Size = UDim2.new(1,0,0,25)
+NameLabel.BackgroundTransparency = 1
+NameLabel.Text = "MÁU BOSS"
+NameLabel.TextColor3 = Color3.fromRGB(255,255,255)
+NameLabel.Font = Enum.Font.GothamBold
+NameLabel.TextSize = 14
+
+local HealthLabel = Frame:FindFirstChild("HealthLabel") or Instance.new("TextLabel")
+HealthLabel.Parent = Frame
+HealthLabel.Size = UDim2.new(1,0,0,30)
+HealthLabel.Position = UDim2.new(0,0,0.4,0)
+HealthLabel.BackgroundTransparency = 1
+HealthLabel.Text = "HP: Đang tìm..."
+HealthLabel.Font = Enum.Font.GothamBold
+HealthLabel.TextSize = 18
+
+RunService.RenderStepped:Connect(function()
+    local target
+
+    for _,obj in pairs(workspace:GetDescendants()) do
+        if obj.Name == "NPC2" and obj:FindFirstChild("Humanoid") then
+            target = obj.Humanoid
+            break
+        end
+    end
+
+    if target and target.Health > 0 then
+        local percent = math.floor((target.Health / target.MaxHealth) * 100)
+
+        HealthLabel.Text = "HP: "..percent.."%"
+
+        -- 🎨 FIX MÀU
+        if percent <= 10 then
+            HealthLabel.TextColor3 = Color3.fromRGB(255, 0, 0) -- đỏ
+        elseif percent <= 30 then
+            HealthLabel.TextColor3 = Color3.fromRGB(255, 180, 0) -- vàng
+        else
+            HealthLabel.TextColor3 = Color3.fromRGB(0, 255, 127) -- xanh
+        end
+
+        Frame.Visible = _G.ShowBossTracker
+    else
+        HealthLabel.Text = "HP: NPC NOT FOUND"
+        HealthLabel.TextColor3 = Color3.fromRGB(255,255,255)
+        Frame.Visible = _G.ShowBossTracker
+    end
+end)
+
+--------------------------------------------------------------------
+--------------------------------------------------------------------
+-- 🛠️ HỆ THỐNG GÓC NHÌN trên boss
+--------------------------------------------------------------------
+local Player = game.Players.LocalPlayer
+
+local RunService = game:GetService("RunService")
+
+local ArenaCenter = Vector3.new(-2790, 233, -1760)
+
+local ArenaRadius = 55
+
+local CameraHeight = 60
+
+local OrbitSpeed = 0.3
+
+local currentAngle = 0
+
+local cameraConnection = nil
+
+local cameraPart = nil
+
+local function getBoss2()
+
+    local gh2 = workspace:FindFirstChild("GiangHo2")
+
+    if not gh2 then return nil end
+
+    local npcs = gh2:FindFirstChild("NPCs")
+
+    if not npcs then return nil end
+
+    return npcs:FindFirstChild("NPC2")
+
+end
+
+local function SetupArenaCamera(enabled)
+
+    if enabled then
+
+        if cameraConnection then
+
+            cameraConnection:Disconnect()
+
+            cameraConnection = nil
+
+        end
+
+        if cameraPart then
+
+            cameraPart:Destroy()
+
+            cameraPart = nil
+
+        end
+
+        
+
+        cameraPart = Instance.new("Part")
+
+        cameraPart.Name = "ArenaCameraAnchor"
+
+        cameraPart.Size = Vector3.new(1, 1, 1)
+
+        cameraPart.Transparency = 1
+
+        cameraPart.CanCollide = false
+
+        cameraPart.Anchored = true
+
+        cameraPart.Parent = workspace
+
+        
+
+        workspace.CurrentCamera.CameraType = Enum.CameraType.Scriptable
+
+        currentAngle = 0
+
+        
+
+        cameraConnection = RunService.RenderStepped:Connect(function(deltaTime)
+
+            if enabled then
+
+                currentAngle = currentAngle + (OrbitSpeed * deltaTime)
+
+                
+
+                local offsetX = math.cos(currentAngle) * ArenaRadius
+
+                local offsetZ = math.sin(currentAngle) * ArenaRadius
+
+                
+
+                local currentCenter = ArenaCenter
+
+                local liveBoss = getBoss2()
+
+                if liveBoss and liveBoss:FindFirstChild("HumanoidRootPart") then
+
+                    currentCenter = liveBoss.HumanoidRootPart.Position
+
+                end
+
+                
+
+                local cameraPos = Vector3.new(
+
+                    currentCenter.X + offsetX,
+
+                    currentCenter.Y + CameraHeight,
+
+                    currentCenter.Z + offsetZ
+
+                )
+
+                
+
+                cameraPart.CFrame = CFrame.new(cameraPos, currentCenter)
+
+                workspace.CurrentCamera.CFrame = cameraPart.CFrame
+
+                workspace.CurrentCamera.CameraSubject = cameraPart
+
+            end
+
+        end)
+
+    else
+
+        if cameraConnection then
+
+            cameraConnection:Disconnect()
+
+            cameraConnection = nil
+
+        end
+
+        if cameraPart then
+
+            cameraPart:Destroy()
+
+            cameraPart = nil
+
+        end
+
+        workspace.CurrentCamera.CameraType = Enum.CameraType.Custom
+
+        if Player.Character then
+
+            workspace.CurrentCamera.CameraSubject = Player.Character:FindFirstChildOfClass("Humanoid")
+
+        end
+
+    end
+
+end
+
+-------------------------------------------------------------------
+-- 🥊 PVP COMBAT - FULL FEATURED (FIXED SPEED & AIM)
+--------------------------------------------------------------------
+local customSpeedMultiplier = 95
+local customJumpForce = 85
+local attackDelay = 0.08
+local activeHitboxes = {}
+local activeHealthGuis = {}
+
+local function clearAllHitboxes()
+    for name, adornment in pairs(activeHitboxes) do
+        if adornment then pcall(function() adornment:Destroy() end) end
+    end
+    activeHitboxes = {}
+end
+
+local function clearAllHealthGuis()
+    for name, gui in pairs(activeHealthGuis) do
+        if gui then pcall(function() gui:Destroy() end) end
+    end
+    activeHealthGuis = {}
+end
+
+local function getClosestPlayer()
+    local closestPlayer = nil
+    local shortestDistance = math.huge
+    local myRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if myRoot then
+        for _, p in pairs(Players:GetPlayers()) do
+            if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") and p.Character:FindFirstChild("Humanoid") and p.Character.Humanoid.Health > 0 then
+                local distance = (myRoot.Position - p.Character.HumanoidRootPart.Position).Magnitude
+                if distance < shortestDistance then
+                    shortestDistance = distance
+                    closestPlayer = p
+                end
+            end
+        end
+    end
+    return closestPlayer
+end
+
+-- Jump Logic
+UserInputService.JumpRequest:Connect(function()
+    if _G.PvpJumpActive then
+        pcall(function()
+            local char = player.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum:GetState() ~= Enum.HumanoidStateType.Freefall then
+                hrp.Velocity = Vector3.new(hrp.Velocity.X, customJumpForce, hrp.Velocity.Z)
+            end
+        end)
+    end
+end)
+
+-- Auto Attack Logic
+task.spawn(function()
+    while true do
+        if _G.PvpAutoAttack then
+            task.defer(function()
+                VirtualUser:ClickButton1(Vector2.new(camera.ViewportSize.X/2, camera.ViewportSize.Y/2))
+            end)
+        end
+        task.wait(attackDelay)
+    end
+end)
+
+-- CORE LOGIC (RenderStepped) - Tích hợp Speed, Spin, Aim, Hitbox, Health
+RunService.RenderStepped:Connect(function()
+    pcall(function()
+        local char = player.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+
+        -- 1. Siêu Tốc Độ (CFrame Method - An toàn, không bị kick)
+        if _G.PvpSpeedActive and hrp and hum and hum.MoveDirection.Magnitude > 0 then
+            hrp.CFrame = hrp.CFrame + (hum.MoveDirection * 3)
+        end
+
+        -- 2. Spin Logic
+        if _G.PvpSpinActive and hrp then
+            if not hrp:FindFirstChild("VND_SpinVelocity") then
+                local spin = Instance.new("BodyAngularVelocity")
+                spin.Name = "VND_SpinVelocity"
+                spin.MaxTorque = Vector3.new(0, math.huge, 0)
+                spin.AngularVelocity = Vector3.new(0, 40, 0)
+                spin.Parent = hrp
+            end
+        else
+            if hrp and hrp:FindFirstChild("VND_SpinVelocity") then hrp["VND_SpinVelocity"]:Destroy() end
+        end
+
+        -- 3. Aim No Cam Logic
+        if _G.PvpAimNoCamActive then
+            local targetPlayer = getClosestPlayer()
+            if targetPlayer and targetPlayer.Character and hrp then
+                local targetPart = targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if targetPart then
+                    local targetPositionNoY = Vector3.new(targetPart.Position.X, hrp.Position.Y, targetPart.Position.Z)
+                    hrp.CFrame = CFrame.new(hrp.Position, targetPositionNoY)
+                end
+            end
+        end
+
+        -- 4. Hitbox Logic
+        if _G.PvpHitboxActive then
+            for _, p in pairs(Players:GetPlayers()) do
+                if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") and p.Character:FindFirstChild("Humanoid") and p.Character.Humanoid.Health > 0 then
+                    local root = p.Character.HumanoidRootPart
+                    root.Size = Vector3.new(5, 5, 5)
+                    root.CanCollide = false
+                    if not activeHitboxes[p.Name] or not activeHitboxes[p.Name].Parent then
+                        if activeHitboxes[p.Name] then activeHitboxes[p.Name]:Destroy() end
+                        local box = Instance.new("BoxHandleAdornment")
+                        box.Size = Vector3.new(5, 6, 5)
+                        box.Color3 = Color3.fromRGB(255, 0, 0)
+                        box.Transparency = 0.6
+                        box.AlwaysOnTop = true
+                        box.ZIndex = 10
+                        box.Adornee = root
+                        box.Parent = game.CoreGui:FindFirstChildOfClass("ScreenGui") or ScreenGui
+                        activeHitboxes[p.Name] = box
+                    end
+                else
+                    if activeHitboxes[p.Name] then
+                        pcall(function() p.Character.HumanoidRootPart.Size = Vector3.new(2, 2, 1) end)
+                        activeHitboxes[p.Name]:Destroy()
+                        activeHitboxes[p.Name] = nil
+                    end
+                end
+            end
+        else
+            if next(activeHitboxes) ~= nil then clearAllHitboxes() end
+        end
+
+        -- 5. Health Gui Logic
+        if _G.PvpHealthActive then
+            for _, p in pairs(Players:GetPlayers()) do
+                if p ~= player and p.Character and p.Character:FindFirstChild("Head") and p.Character:FindFirstChild("Humanoid") and p.Character.Humanoid.Health > 0 then
+                    local healthString = "❤️ "..math.floor(p.Character.Humanoid.Health).." / "..math.floor(p.Character.Humanoid.MaxHealth)
+                    local currentGui = activeHealthGuis[p.Name]
+                    if not currentGui or not currentGui.Parent then
+                        local bGui = Instance.new("BillboardGui")
+                        bGui.Name = "VND_HealthGui"
+                        bGui.Size = UDim2.new(0, 200, 0, 50)
+                        bGui.StudsOffset = Vector3.new(0, 3.5, 0)
+                        bGui.AlwaysOnTop = true
+                        local textLabel = Instance.new("TextLabel", bGui)
+                        textLabel.BackgroundTransparency = 1
+                        textLabel.Size = UDim2.new(1, 0, 1, 0)
+                        textLabel.Font = Enum.Font.GothamBold
+                        textLabel.TextSize = 14
+                        textLabel.TextColor3 = Color3.fromRGB(0, 255, 127)
+                        textLabel.TextStrokeTransparency = 0
+                        textLabel.Text = healthString
+                        bGui.Adornee = p.Character.Head
+                        bGui.Parent = game.CoreGui:FindFirstChildOfClass("ScreenGui") or ScreenGui
+                        activeHealthGuis[p.Name] = bGui
+                    else
+                        currentGui:FindFirstChildOfClass("TextLabel").Text = healthString
+                    end
+                else
+                    if activeHealthGuis[p.Name] then activeHealthGuis[p.Name]:Destroy() activeHealthGuis[p.Name] = nil end
+                end
+            end
+        else
+            if next(activeHealthGuis) ~= nil then clearAllHealthGuis() end
+        end
+    end)
+end)
+
+
+
+------------------------------------------------
+-- 🩹 AUTO BANDAGE
+------------------------------------------------
+task.spawn(function() while true do task.wait(1) if _G.AutoBandageEnabled then pcall(function() local plr = game:GetService("Players").LocalPlayer local hum = plr.Character and plr.Character:FindFirstChild("Humanoid") if hum and hum.Health > 0 and hum.Health < (hum.MaxHealth * 0.8) then game:GetService("ReplicatedStorage").Remotes.Heal:FireServer() end end) end end end)
+
+
+-- =================================== -- 🔄 VND HUB | AUTO SHOP - MUA BĂNG GẠC (15 GIÂY) -- =====================================
+local ShopRemote = game:GetService("ReplicatedStorage")
+    :WaitForChild("KnitPackages")
+    :WaitForChild("_Index")
+    :WaitForChild("sleitnick_knit@1.7.0")
+    :WaitForChild("knit")
+    :WaitForChild("Services")
+    :WaitForChild("ShopService")
+    :WaitForChild("RE")
+    :WaitForChild("buyItem")
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if _G.AutoBuyBandage and (tick() - lastBuy >= 15) then
+            lastBuy = tick()
+            
+            -- Ép kiểu số nguyên để chắc chắn Server nhận đúng
+            local quantity = tonumber(_G.AutoBuyBandageAmount) or 1
+            
+            pcall(function()
+                print("Đang gửi lệnh mua: Băng gạc, Số lượng: " .. quantity)
+                ShopRemote:FireServer("băng gạc", quantity)
+            end)
+        end
+    end
+end)
+------------------------------------------------
+-- HỆ THỐNG QUẢN LÝ ĐA CẤU HÌNH ĐƠN LẺ ĐỘC LẬP
+------------------------------------------------
+if makefolder and not isfolder(ConfigFolderName) then
+    makefolder(ConfigFolderName)
+end
+
+local RegisteredToggles = {
+    ["AutoFarmLevelToggle"] = "AutoFarmLevel",
+    ["AutoFarmChuaToggle"] = "AutoFarmChua",
+    ["AntiAFKToggle"] = "AntiAFKEnabled",
+    ["AutoFarmBanhMiToggle"] = "AutoFarmBanhMi",
+    ["AutoFarmBenhVienToggle"] = "AutoFarmBenhVien",
+    ["AutoFarmCaoSuToggle"] = "AutoFarmCaoSu",
+    ["AutoFarmChotCongAnToggle"] = "AutoFarmChotCongAn",
+    ["AutoFarmSuKienToggle"] = "AutoFarmSuKien",
+    ["AutoFarmMatOngToggle"] = "AutoFarmMatOng", 
+    ["TeleportToBossToggle"] = "TeleportToBoss",
+    ["AutoFarmBossCircleToggle"] = "AutoFarmBossCircle",
+    ["AutoAimBossNoCamToggle"] = "AutoAimBossNoCam",
+    ["FreecamToggle"] = "FreecamEnabled",
+    ["LockCameraToggle"] = "LockCameraEnabled",
+    ["PvpProModeToggle"] = "PvpProMode",
+    ["PvpAutoAttackToggle"] = "PvpAutoAttack",
+    ["PvpSpinToggle"] = "PvpSpinActive",
+    ["PvpAimNoCamToggle"] = "PvpAimNoCamActive",
+    ["PvpHitboxToggle"] = "PvpHitboxActive",
+    ["PvpHealthToggle"] = "PvpHealthActive",
+    ["AutoBandageToggle"] = "AutoBandageEnabled",
+    ["AutoBuyBandageToggle"] = "AutoBuyBandage",
+    ["PvpSpeedToggle"] = "PvpSpeedActive",
+    ["PvpJumpToggle"] = "PvpJumpActive",
+    ["FPSBoostNewToggle"] = "FPSBoostState",
+    ["Reduce20Toggle"] = "Reduce20State",
+    ["Reduce40Toggle"] = "Reduce40State",
+    ["Reduce60Toggle"] = "Reduce60State",
+    ["Reduce100Toggle"] = "Reduce100State",
+    ["ClearEverythingToggle"] = "ClearEverythingState"
+}
+
+local function getAllConfigFiles()
+    local list = {}
+    if listfiles then
+        local files = listfiles(ConfigFolderName)
+        for _, fullPath in ipairs(files) do
+            local name = fullPath:match("([^/\\]+)%.json$") or fullPath:match("([^/\\]+)$")
+            if name then table.insert(list, name) end
+        end
+    end
+    if #list == 0 then table.insert(list, "Chưa có config nào") end
+    return list
+end
+
+local function saveGlobalSystemSettings()
+    local globalData = {
+        UseConfigSystem = _G.UseConfigSystem,
+        SelectedConfigName = _G.SelectedConfigName
+    }
+    writefile(GlobalSettingsFile, HttpService:JSONEncode(globalData))
+end
+
+local function saveNewConfigWithName(customName)
+    if customName == "" or customName == "Nhập tên cấu hình cần tạo..." then
+        Fluent:Notify({Title = "Lỗi", Content = "Vui lòng nhập tên cấu hình hợp lệ trước!", Duration = 3})
+        return
+    end
+    
+    local configData = {}
+    for uiName, globalVar in pairs(RegisteredToggles) do
+         configData[globalVar] = _G[globalVar] or false
+    end
+    
+    local filePath = ConfigFolderName .. "/" .. customName .. ".json"
+    writefile(filePath, HttpService:JSONEncode(configData))
+    
+    _G.SelectedConfigName = customName
+    saveGlobalSystemSettings()
+    
+    if Fluent.Options and Fluent.Options["SelectConfigDropdown"] then
+        local newList = getAllConfigFiles()
+        Fluent.Options["SelectConfigDropdown"]:SetValues(newList)
+        Fluent.Options["SelectConfigDropdown"]:SetValue(customName)
+    end
+    
+    Fluent:Notify({Title = "Hệ thống Config", Content = "Đã lưu cấu hình đơn: " .. customName, Duration = 3})
+end
+
+local function loadSelectedConfig(customName)
+    if customName == "Chưa có config nào" or customName == "" then return end
+    local filePath = ConfigFolderName .. "/" .. customName .. ".json"
+    if isfile(filePath) then
+        local fileContent = readfile(filePath)
+        local success, data = pcall(function() return HttpService:JSONDecode(fileContent) end)
+        
+        if success and data then
+             for uiName, globalVar in pairs(RegisteredToggles) do
+                if data[globalVar] ~= nil then
+                    _G[globalVar] = data[globalVar]
+                    
+                    if Fluent.Options and Fluent.Options[uiName] then
+                         Fluent.Options[uiName]:SetValue(data[globalVar])
+                    end
+                    
+                    if globalVar == "FPSBoostState" and data[globalVar] == true then activateFPSBoost() end
+                    if globalVar == "Reduce20State" then toggleGraphicReduction(20, data[globalVar]) end
+                    if globalVar == "Reduce40State" then toggleGraphicReduction(40, data[globalVar]) end
+                    if globalVar == "Reduce60State" then toggleGraphicReduction(60, data[globalVar]) end
+                    if globalVar == "Reduce100State" then toggleGraphicReduction(100, data[globalVar]) end
+                    if globalVar == "ClearEverythingState" and data[globalVar] == true then
+                        activateFPSBoost()
+                        for _, v in ipairs(workspace:GetDescendants()) do
+                            if v:IsA("Decal") or v:IsA("Texture") or v:IsA("Sound") then pcall(function() v:Destroy() end) end
+                            if v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") then v.Enabled = false end
+                            if v:IsA("BasePart") then v.Material = Enum.Material.SmoothPlastic v.Reflectance = 0 v.CastShadow = false end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function deleteSelectedConfig(customName)
+    if customName == "Chưa có config nào" or customName == "" then return end
+    local filePath = ConfigFolderName .. "/" .. customName .. ".json"
+    if isfile(filePath) then
+        delfile(filePath)
+        _G.SelectedConfigName = ""
+        saveGlobalSystemSettings()
+        
+        local newList = getAllConfigFiles()
+        if Fluent.Options and Fluent.Options["SelectConfigDropdown"] then
+            Fluent.Options["SelectConfigDropdown"]:SetValues(newList)
+            Fluent.Options["SelectConfigDropdown"]:SetValue(newList[1] or "Chưa có config nào")
+        end
+        
+        Fluent:Notify({Title = "Hệ thống Config", Content = "Đã xóa file cấu hình đơn: " .. customName, Duration = 3})
+    else
+        Fluent:Notify({Title = "Lỗi", Content = "Không tìm thấy file để xóa!", Duration = 3})
+    end
+end
+
+------------------------------------------------
+-- TAB 1: Main 🏠
+------------------------------------------------
+local ProfileParagraph = Tabs.Main1:AddParagraph({
+    Title = "👤 THÔNG TIN TÀI KHOẢN",
+    Text = "Tên hiển thị: " .. tostring(player.DisplayName) .. "\nTên tài khoản: @" .. tostring(player.Name),
+    Image = "rbxassetid://126677255840605"
+})
+
+task.spawn(function()
+    pcall(function()
+        local userId = player.UserId
+        local avatarUrl, isReady = Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size420x420)
+        if isReady and avatarUrl then
+            ProfileParagraph:SetText("Tên hiển thị: " .. tostring(player.DisplayName) .. "\nTên tài khoản: @" .. tostring(player.Name))
+            if ProfileParagraph.Image then ProfileParagraph.Image = avatarUrl end
+        end
+    end)
+end)
+
+Tabs.Main1:AddButton({
+	Title = "💬 Zalo Hỗ Trợ: 0398342212",              
+	Callback = function() setclipboard("0398342212") Fluent:Notify({Title = "VND💵 System", Content = "Đã sao chép SĐT Zalo!", Duration = 3}) end
+})
+
+Tabs.Main1:AddButton({
+	Title = "🎬 TikTok Hỗ Trợ (Click để Sao Chép)",              
+	Callback = function() setclipboard("https://www.tiktok.com/@biidocdvn?_r=1&_t=ZS-96hDXKNtEzI") Fluent:Notify({Title = "VND💵 System", Content = "Đã sao chép link TikTok!", Duration = 3}) end
+})
+
+------------------------------------------------
+-- TAB 2: Farm Level ⚔️
+------------------------------------------------
+Tabs.Main2:AddToggle("AutoFarmLevelToggle",{Title="Auto Farm NPC",Default=false,Callback=function(Value)_G.AutoFarmLevel=Value end})
+Tabs.Main2:AddSlider("NpcDistanceSlider",{Title="Khoảng cách",Min=10,Max=25,Default=18,Rounding=1,Callback=function(Value)_G.Settings.DashDist=Value end})
+Tabs.Main2:AddSlider("NpcSpeedSlider",{Title="Tốc độ Dash NPC",Min=1,Max=20,Default=5,Rounding=1,Increment=1,Callback=function(Value)_G.Settings.Speed=Value/100 end})
+Tabs.Main2:AddToggle("AutoLootToggle", { Title = "Auto Nhặt Đồ (Loot)", Default = false, Callback = function(Value) _G.AutoLootEnabled = Value end })
+Tabs.Main2:AddToggle("AutoFarmChuaToggle", { Title = "Auto Farm Ở Chùa", Default = false, Callback = function(Value) _G.AutoFarmChua = Value end })
+Tabs.Main2:AddToggle("AntiAFKToggle", { Title = "Kích Hoạt Anti-AFK", Default = false, Callback = function(Value) _G.AntiAFKEnabled = Value end })
+Tabs.Main2:AddButton({ Title = "admin", Callback = function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-Infinite-Yield-43437"))() end })
+Tabs.Main2:AddButton({ Title = "vfly", Callback = function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-V-fly-20577"))() end })
+
+
+------------------------------------------------
+-- TAB 3: Farm Tiền 💵
+------------------------------------------------
+Tabs.Main3:AddToggle("AutoFarmBanhMiToggle", { Title = "Auto Farm Bánh Mì", Default = false, Callback = function(Value) _G.AutoFarmBanhMi = Value end })
+Tabs.Main3:AddToggle("AutoFarmBenhVienToggle", { Title = "Auto Farm Bệnh Viện", Default = false, Callback = function(Value) _G.AutoFarmBenhVien = Value end })
+Tabs.Main3:AddToggle("AutoFarmCaoSuToggle", { Title = "Auto Farm Cao Su", Default = false, Callback = function(Value) _G.AutoFarmCaoSu = Value end })
+Tabs.Main3:AddToggle("AutoFarmChotCongAnToggle", { Title = "Auto Farm Chốt Công An", Default = false, Callback = function(Value) _G.AutoFarmChotCongAn = Value end })
+
+------------------------------------------------
+-- TAB 4: Mua đồ 
+------------------------------------------------
+Tabs.Main4:AddDropdown("SelectItemDropdown", {
+    Title = "Chọn vũ khí",
+    Values = itemList,
+    Multi = false,
+    Default = nil,
+    Callback = function(Value)
+        _G.SelectedItem = Value
+    end
+})
+Tabs.Main4:AddDropdown("SelectVehicleDropdown", {
+    Title = "Chọn xe",
+    Values = vehicleList,
+    Multi = false,
+    Default = nil,
+    Callback = function(Value)
+        _G.SelectedVehicle = Value
+    end
+})
+Tabs.Main4:AddDropdown("SelectFoodDropdown", {
+    Title = "Vật phẩm",
+    Values = foodList,
+    Multi = false,
+    Default = nil,
+    Callback = function(Value)
+        _G.SelectedFood = Value
+    end
+})
+Tabs.Main4:AddButton({
+    Title = "Mua tất cả các lựa chọn",
+    Callback = function()
+        local hasSelected = false
+
+        -- Mua Món ăn nếu có chọn
+        if _G.SelectedFood then
+            buyItemEvent:FireServer(_G.SelectedFood)
+            Fluent:Notify({Title = "Mua Món ăn", Content = "Đang mua: " .. _G.SelectedFood, Duration = 3})
+            hasSelected = true
+        end
+            
+        -- Mua Vật phẩm nếu có chọn
+        if _G.SelectedItem then
+            buyItemEvent:FireServer(_G.SelectedItem)
+            Fluent:Notify({Title = "Mua Vật phẩm", Content = "Đang mua: " .. _G.SelectedItem, Duration = 3})
+            hasSelected = true
+        end
+            
+        -- Mua Xe nếu có chọn
+        if _G.SelectedVehicle then
+            remoteEvent:FireServer(_G.SelectedVehicle)
+            Fluent:Notify({Title = "Mua Xe", Content = "Đang mua: " .. _G.SelectedVehicle, Duration = 3})
+            hasSelected = true
+        end
+            
+        -- Thông báo nếu không có gì được chọn
+        if not hasSelected then
+            Fluent:Notify({Title = "Lỗi", Content = "Bạn chưa chọn bất kỳ món nào để mua!", Duration = 3})
+        end
+    end
+})
+
+------------------------------------------------
+-- TAB 5: Farm Sự Kiện 🎃
+------------------------------------------------
+Tabs.Main5:AddToggle("AutoFarmSuKienToggle", { Title = "Auto Farm Sự Kiện", Default = false, Callback = function(Value) _G.AutoFarmSuKien = Value end })
+Tabs.Main5:AddToggle("AutoFarmMatOngToggle", { Title = "Auto Farm Mật Ong", Default = false, Callback = function(Value) _G.AutoFarmMatOng = Value end })
+
+------------------------------------------------
+-- TAB 6:: Farm Boss 👹
+------------------------------------------------
+Tabs.Main6:AddToggle("TeleportToBossToggle",{Title="Dịch Chuyển Đến Boss",Default=false,Callback=function(Value)_G.TeleportToBoss=Value end})
+Tabs.Main6:AddToggle("AutoFarmBossCircleToggle",{Title="Auto Farm Boss",Default=false,Callback=function(Value)_G.AutoFarmBossCircle=Value end})
+Tabs.Main6:AddDropdown("BossFarmModeDropdown", {
+    Title = "Chế Độ Farm",
+    Values = {"Chế Độ 1", "Chế Độ 2", "Chế Độ 3"},
+    Default = "Chế Độ 1",
+    Callback = function(Value)
+        _G.SelectedBossMode = Value
+        
+        -- Cập nhật thông số hiện tại vào các ô Input khi chuyển chế độ
+        if Fluent.Options["BossDistanceInput"] then
+            if Value == "Chế Độ 1" then
+                Fluent.Options["BossDistanceInput"]:SetValue(tostring(_G.BossSettings.Mode1.Dist))
+            elseif Value == "Chế Độ 2" then
+                Fluent.Options["BossDistanceInput"]:SetValue(tostring(_G.BossSettings.Mode2.Radius))
+            end
+        end
+        
+        if Fluent.Options["BossSpeedInput"] then
+            if Value == "Chế Độ 1" then
+                Fluent.Options["BossSpeedInput"]:SetValue(tostring(_G.BossSettings.Mode1.Speed * 100))
+            elseif Value == "Chế Độ 2" then
+                Fluent.Options["BossSpeedInput"]:SetValue(tostring(_G.BossSettings.Mode2.Speed * 1000))
+            end
+        end
+    end
+})
+Tabs.Main6:AddInput("BossDistanceInput", {
+    Title = "Khoảng cách",
+    Placeholder = "Nhập...",
+    Numeric = true,
+    Finished = true,
+    Callback = function(Value)
+        local n = tonumber(Value)
+        if n and n >= 0 then
+            if _G.SelectedBossMode == "Chế Độ 1" then
+                _G.BossSettings.Mode1.Dist = n
+            elseif _G.SelectedBossMode == "Chế Độ 2" then
+                _G.BossSettings.Mode2.Radius = n
+            end
+        end
+    end
+})
+Tabs.Main6:AddInput("BossSpeedInput", {
+    Title = "Tốc độ",
+    Placeholder = "Nhập (1-1000)...",
+    Numeric = true,
+    Finished = true,
+    Callback = function(Value)
+        local n = tonumber(Value)
+        if n and n >= 0.00000001 and n <= 10000 then
+            if _G.SelectedBossMode == "Chế Độ 1" then
+                _G.BossSettings.Mode1.Speed = n / 100
+            elseif _G.SelectedBossMode == "Chế Độ 2" then
+                _G.BossSettings.Mode2.Speed = n / 1000 -- Chia 1000 cho ổn định
+            end
+        end
+    end
+})
+Tabs.Main6:AddToggle("AutoLootBossToggle",{Title="Auto Nhặt Đồ Loot Boss",Default=false,Callback=function(Value)_G.AutoLootBossEnabled=Value end})
+Tabs.Main6:AddToggle("AutoAimBossNoCamToggle",{Title="Aim Hướng Đánh (Giữ Tự Do Cam) 🎯",Default=false,Callback=function(Value)_G.AutoAimBossNoCam=Value end})
+Tabs.Main6:AddToggle("BossTrackerToggle",{Title="Hiện Máu Boss",Default=false,Callback=function(Value)_G.ShowBossTracker=Value Frame.Visible=Value end})
+Tabs.Main6:AddToggle("BossCameraOrbit", {Title = "Camera xoay xung quanh", Default = false, Callback = function(v) _G.ArenaCameraEnabled = v; SetupArenaCamera(v) end})
+
+------------------------------------------------
+-- TAB 7: PVP Combat 🥊 (ĐÃ SỬA: XÓA CHỮ "LẺ" & GHI CHÚ)
+------------------------------------------------
+Tabs.Main7:AddToggle("PvpAimNoCamToggle", { Title = "Aim Nhân Vật", Default = false, Callback = function(Value) _G.PvpAimNoCamActive = Value end })
+Tabs.Main7:AddToggle("PvpAutoAttackToggle", { Title = "Auto Click Tấn Công", Default = false, Callback = function(Value) _G.PvpAutoAttack = Value end })
+Tabs.Main7:AddToggle("AutoBandageToggle", { Title = "Auto Heal", Default = false, Callback = function(Value) _G.AutoBandageEnabled = Value end })
+Tabs.Main7:AddToggle("AutoBuyBandageToggle",{Title="Auto Mua Băng Gạc",Default=false,Callback=function(v)_G.AutoBuyBandage=v if v then lastBuy=tick()-999 end end})
+Tabs.Main7:AddInput("AutoBuyAmount", {Title = "Số lượng", Default = tostring(_G.AutoBuyBandageAmount or 1), Placeholder = "Nhập số lượng...", Numeric = true, Finished = false, Callback = function(v) local n = tonumber(v) if n and n > 0 then _G.AutoBuyBandageAmount = math.floor(n) end end})
+Tabs.Main7:AddToggle("PvpHitboxToggle", { Title = "Khung Hitbox Tầm Nhìn", Default = false, Callback = function(Value) _G.PvpHitboxActive = Value if not Value then clearAllHitboxes() end end })
+Tabs.Main7:AddToggle("PvpHealthToggle", { Title = "Hiện Máu Trên Đầu", Default = false, Callback = function(Value) _G.PvpHealthActive = Value if not Value then clearAllHealthGuis() end end })
+Tabs.Main7:AddToggle("PvpSpinToggle", { Title = "Spin", Default = false, Callback = function(Value) _G.PvpSpinActive = Value end })
+Tabs.Main7:AddToggle("PvpSpeedToggle", { Title = "Siêu Tốc Độ Chạy", Default = false, Callback = function(Value) _G.PvpSpeedActive = Value end })
+Tabs.Main7:AddToggle("PvpJumpToggle", { Title = "Siêu Nhảy Cao", Default = false, Callback = function(Value) _G.PvpJumpActive = Value end })
+
+------------------------------------------------
+-- TAB 8: Fix Lag ⚡
+------------------------------------------------
+Tabs.Main8:AddToggle("FPSBoostNewToggle", { Title = "🚀 Kích Hoạt FPS Boost", Default = false, Callback = function(Value) _G.FPSBoostState = Value if Value then activateFPSBoost() else deactivateFPSBoost() end end })
+Tabs.Main8:AddToggle("Reduce20Toggle", { Title = "📉 Xóa 20% Đồ Họa Gốc", Default = false, Callback = function(Value) _G.Reduce20State = Value toggleGraphicReduction(20, Value) end })
+Tabs.Main8:AddToggle("Reduce40Toggle", { Title = "📉 Xóa 40% Đồ Họa Gốc", Default = false, Callback = function(Value) _G.Reduce40State = Value toggleGraphicReduction(40, Value) end })
+Tabs.Main8:AddToggle("Reduce60Toggle", { Title = "📉 Xóa 60% Đồ Họa Gốc", Default = false, Callback = function(Value) _G.Reduce60State = Value toggleGraphicReduction(60, Value) end })
+Tabs.Main8:AddToggle("Reduce100Toggle", { Title = "📉 Xóa 100% Đồ Họa Gốc", Default = false, Callback = function(Value) _G.Reduce100State = Value toggleGraphicReduction(100, Value) end })
+Tabs.Main8:AddToggle("ClearEverythingToggle", {
+    Title = "❌ Xóa Sạch Texture & Hiệu Ứng", Default = false, 
+    Callback = function(Value)
+        _G.ClearEverythingState = Value
+        if Value then
+            activateFPSBoost()
+            for _, v in ipairs(workspace:GetDescendants()) do
+                if v:IsA("Decal") or v:IsA("Texture") or v:IsA("Sound") then pcall(function() v:Destroy() end) end
+                if v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") then v.Enabled = false end
+                if v:IsA("BasePart") then v.Material = Enum.Material.SmoothPlastic v.Reflectance = 0 v.CastShadow = false end
+            end
+        end
+    end
+})
+
+------------------------------------------------
+-- TAB 9: Settings ⚙️
+------------------------------------------------
+Tabs.Main9:AddParagraph({
+    Title = "Hệ Thống Quản Lý Đa Cấu Hình (Config)",
+    Text = "Từng công tắc gạt đơn lẻ sẽ được lưu trạng thái độc lập. Bạn có thể tự đặt tên, tạo nhiều cấu hình, tự chọn để áp dụng hoặc xóa cấu hình tùy ý."
+})
+
+local NewConfigNameInput = ""
+
+Tabs.Main9:AddInput("ConfigNameInput", {
+    Title = "Cấu hình mới",
+    Default = "", 
+    Placeholder = "Nhập chữ liền không dấu rồi ấn ENTER...",
+    Numeric = false,
+    Finished = true, 
+    Callback = function(Value)
+        local cleanedValue = Value:gsub("%s+", "")
+        if cleanedValue ~= "" then
+            NewConfigNameInput = cleanedValue
+            Fluent:Notify({Title = "Hệ thống Config", Content = "✍️ Đã ghi nhận tên: " .. cleanedValue, Duration = 2})
+        end
+    end
+})
+
+Tabs.Main9:AddButton({
+    Title = "Tạo Cấu Hình Mới",
+    Callback = function() 
+        if NewConfigNameInput == "" then
+            Fluent:Notify({Title = "Lỗi", Content = "Vui lòng nhập tên cấu hình vào ô phía trên và ấn Enter trước!", Duration = 3})
+        else
+            saveNewConfigWithName(NewConfigNameInput) 
+        end
+    end
+})
+
+local ConfigDropdown = Tabs.Main9:AddDropdown("SelectConfigDropdown", {
+    Title = "Danh sách",
+    Values = getAllConfigFiles(),
+    Default = "Chưa có config nào",
+    Callback = function(Value)
+        if Value ~= "Chưa có config nào" and Value ~= "" then
+            _G.SelectedConfigName = Value
+            saveGlobalSystemSettings()
+            if _G.UseConfigSystem then loadSelectedConfig(Value) end
+        end
+    end
+})
+
+Tabs.Main9:AddToggle("UseConfigSystemToggle", {
+    Title = "Sử Dụng Config Đang Chọn",
+    Default = false,
+    Callback = function(Value)
+        _G.UseConfigSystem = Value
+        saveGlobalSystemSettings()
+        if Value and _G.SelectedConfigName ~= "" and _G.SelectedConfigName ~= "Chưa có config nào" then
+            loadSelectedConfig(_G.SelectedConfigName)
+        end
+    end
+})
+
+Tabs.Main9:AddButton({
+    Title = "Xóa Cấu Hình Đang Chọn",
+    Callback = function()
+        if _G.SelectedConfigName ~= "" and _G.SelectedConfigName ~= "Chưa có config nào" then
+            deleteSelectedConfig(_G.SelectedConfigName)
+        else
+            Fluent:Notify({Title = "Lỗi", Content = "Hãy chọn một cấu hình từ danh sách trước khi xóa!", Duration = 3})
+        end
+    end
+})
+
+-- 🚀 ĐỒNG BỘ HÓA TỰ ĐỘNG KHI VÀO GAME
+task.defer(function()
+    while not Fluent.Options or not Fluent.Options["UseConfigSystemToggle"] or not Fluent.Options["SelectConfigDropdown"] do
+        task.wait(0.2)
+    end
+    
+    if isfile(GlobalSettingsFile) then
+        pcall(function()
+            local data = HttpService:JSONDecode(readfile(GlobalSettingsFile))
+            if data and data["SelectedConfigName"] then
+                _G.SelectedConfigName = data["SelectedConfigName"]
+                _G.UseConfigSystem = data["UseConfigSystem"] or false
+                
+                Fluent.Options["UseConfigSystemToggle"]:SetValue(_G.UseConfigSystem)
+                Fluent.Options["SelectConfigDropdown"]:SetValue(_G.SelectedConfigName)
+                
+                if _G.UseConfigSystem then
+                    loadSelectedConfig(_G.SelectedConfigName)
+                    Fluent:Notify({Title = "VND💵 System", Content = "Đã tự động nạp & kích hoạt: " .. _G.SelectedConfigName, Duration = 5})
+                end
+            end
+        end)
+    end
+end)
